@@ -1,5 +1,7 @@
 # HQPorner Telegram Bot (Multi-User Pro Edition)
 
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Exon101x/hqporner-telegram-bot/blob/main/notebooks/colab_runner.ipynb) [![Kaggle Notebook](https://kaggle.com/static/images/open-in-kaggle.svg)](https://kaggle.com/kernels/welcome?src=https://github.com/Exon101x/hqporner-telegram-bot/blob/main/notebooks/kaggle_runner.ipynb)
+
 An asynchronous, feature-rich Telegram bot with **native 2 GB video upload support**, built on top of [`unofficial-api-for-hqporner`](https://github.com/EchterAlsFake/unofficial-api-for-hqporner) by **EchterAlsFake** and powered by [`Telethon`](https://github.com/LonamiWebs/Telethon) (MTProto).
 
 ## Credits & Upstream Attribution
@@ -77,6 +79,23 @@ You can also paste 1–5 `hqporner.com` or `m.hqporner.com` links directly in ch
 | `DOWNLOAD_DIR` | No | System temp | Directory for temporary downloads (auto-cleaned after each upload) | 
 | `BOT_DATA_FILE` | No | `bot_data.json` | JSON file storing favorites, history, settings, bans, and stats | 
 
+## Repository Structure
+
+```text
+hqporner-telegram-bot/
+├── bot.py                        # Main Telethon MTProto bot (2 GB uploads, rate limiting, UI)
+├── requirements.txt              # Python dependencies
+├── .env.example                  # Environment variables template
+├── .gitignore                    # Ignores secrets, sessions, caches, and temp downloads
+├── README.md                     # Documentation & credits
+├── notebooks/
+│   ├── kaggle_runner.ipynb       # Ready-to-run Kaggle Notebook
+│   └── colab_runner.ipynb        # Ready-to-run Google Colab Notebook (with form UI)
+└── scripts/
+    ├── run_vps.sh                # Ubuntu/Debian VPS installer + systemd service (no Docker)
+    └── run_termux.sh             # Termux (Android) setup & launch script
+```
+
 ## Quick Deployment Guides
 
 ### 1. Kaggle Notebook (Instant Run, \~15 Seconds)
@@ -93,7 +112,7 @@ You can also paste 1–5 `hqporner.com` or `m.hqporner.com` links directly in ch
 3. Export `TELEGRAM_BOT_TOKEN`, `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, and `ADMIN_USER_IDS` via `os.environ`, then launch with unbuffered output:
 
    ```
-   python -u bot_kaggle.py
+   python -u bot.py
    
    ```
 
@@ -108,11 +127,11 @@ export TELEGRAM_BOT_TOKEN="your_token"
 export TELEGRAM_API_ID="your_api_id"
 export TELEGRAM_API_HASH="your_api_hash"
 export ADMIN_USER_IDS="your_telegram_id"
-python -u bot_kaggle.py
+python -u bot.py
 
 ```
 
-For 24/7 operation on a VPS, run `bot_kaggle.py` under a `systemd` service with `Restart=on-failure` and `EnvironmentFile=/path/to/.env`.
+For 24/7 operation on a VPS, run `bot.py` under a `systemd` service with `Restart=on-failure` and `EnvironmentFile=/path/to/.env`.
 
 ### 3. Termux (Android `aarch64`)
 
@@ -123,7 +142,7 @@ python -m venv --system-site-packages .venv
 source .venv/bin/activate
 pip install unofficial-api-for-hqporner telethon cryptg
 termux-wake-lock
-python -u bot_kaggle.py
+python -u bot.py
 
 ```
 
