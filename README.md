@@ -1,6 +1,6 @@
 # HQPorner Telegram Bot (Multi-User Pro Edition)
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Exon101x/hqporner-telegram-bot/blob/main/notebooks/colab_runner.ipynb) [![Kaggle Notebook](https://kaggle.com/static/images/open-in-kaggle.svg)](https://kaggle.com/kernels/welcome?src=https://github.com/Exon101x/hqporner-telegram-bot/blob/main/notebooks/kaggle_runner.ipynb)
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Exon101x/hqporner-dl-bot/blob/main/notebooks/colab_runner.ipynb) [![Kaggle Notebook](https://kaggle.com/static/images/open-in-kaggle.svg)](https://kaggle.com/kernels/welcome?src=https://github.com/Exon101x/hqporner-dl-bot/blob/main/notebooks/kaggle_runner.ipynb)
 
 An asynchronous, feature-rich Telegram bot with **native 2 GB video upload support**, built on top of [`unofficial-api-for-hqporner`](https://github.com/EchterAlsFake/unofficial-api-for-hqporner) by **EchterAlsFake** and powered by [`Telethon`](https://github.com/LonamiWebs/Telethon) (MTProto).
 
@@ -82,7 +82,7 @@ You can also paste 1–5 `hqporner.com` or `m.hqporner.com` links directly in ch
 ## Repository Structure
 
 ```text
-hqporner-telegram-bot/
+hqporner-dl-bot/
 ├── bot.py                        # Main Telethon MTProto bot (2 GB uploads, rate limiting, UI)
 ├── requirements.txt              # Python dependencies
 ├── .env.example                  # Environment variables template
