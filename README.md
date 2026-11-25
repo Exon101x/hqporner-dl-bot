@@ -70,7 +70,8 @@ You can also paste 1–5 `hqporner.com` or `m.hqporner.com` links directly in ch
 | `ADMIN_USER_IDS` | No | *(empty)* | Comma-separated admin Telegram user IDs (bypass rate limits & access `/admin`) | 
 | `ALLOWED_USER_IDS` | No | *(empty)* | Comma-separated allowlist of user IDs (leave blank to allow all users) | 
 | `MAX_UPLOAD_MB` | No | `2000` | Maximum video upload size in MB | 
-| `MAX_CONCURRENT_DOWNLOADS` | No | `3` | Global parallel download slots | 
+| `MAX_CONCURRENT_DOWNLOADS` | No | `3` | Global parallel download slots |
+| `UPLOAD_WORKERS` | No | `8` | Parallel 512 KB MTProto upload workers | 
 | `MAX_USER_CONCURRENT_DOWNLOADS` | No | `1` | Maximum simultaneous downloads per standard user | 
 | `COMMAND_COOLDOWN_SEC` | No | `3` | Cooldown in seconds between commands/button taps | 
 | `DOWNLOAD_COOLDOWN_SEC` | No | `30` | Cooldown in seconds between downloads per user | 
@@ -78,23 +79,6 @@ You can also paste 1–5 `hqporner.com` or `m.hqporner.com` links directly in ch
 | `PAGE_SIZE` | No | `5` | Default number of results per page | 
 | `DOWNLOAD_DIR` | No | System temp | Directory for temporary downloads (auto-cleaned after each upload) | 
 | `BOT_DATA_FILE` | No | `bot_data.json` | JSON file storing favorites, history, settings, bans, and stats | 
-
-## Repository Structure
-
-```text
-hqporner-dl-bot/
-├── bot.py                        # Main Telethon MTProto bot (2 GB uploads, rate limiting, UI)
-├── requirements.txt              # Python dependencies
-├── .env.example                  # Environment variables template
-├── .gitignore                    # Ignores secrets, sessions, caches, and temp downloads
-├── README.md                     # Documentation & credits
-├── notebooks/
-│   ├── kaggle_runner.ipynb       # Ready-to-run Kaggle Notebook
-│   └── colab_runner.ipynb        # Ready-to-run Google Colab Notebook (with form UI)
-└── scripts/
-    ├── run_vps.sh                # Ubuntu/Debian VPS installer + systemd service (no Docker)
-    └── run_termux.sh             # Termux (Android) setup & launch script
-```
 
 ## Quick Deployment Guides
 

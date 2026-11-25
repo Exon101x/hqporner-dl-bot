@@ -20,6 +20,9 @@ import inspect
 import json
 import logging
 import os
+import hashlib
+import io
+import math
 from pathlib import Path
 import re
 import shutil
@@ -33,7 +36,9 @@ import urllib.request
 from hqporner_api import Client, DownloadConfigRAW
 from telethon import Button, TelegramClient, events
 from telethon.errors import MessageNotModifiedError
-from telethon.tl.types import DocumentAttributeVideo
+from telethon.helpers import generate_random_long
+from telethon.tl.functions.upload import SaveBigFilePartRequest, SaveFilePartRequest
+from telethon.tl.types import DocumentAttributeVideo, InputFile, InputFileBig
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -53,6 +58,7 @@ API_ID = int(os.environ["TELEGRAM_API_ID"].strip())
 API_HASH = os.environ["TELEGRAM_API_HASH"].strip()
 MAX_UPLOAD_MB = float(os.getenv("MAX_UPLOAD_MB", "2000"))
 MAX_CONCURRENT_DOWNLOADS = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "3"))
+UPLOAD_WORKERS = int(os.getenv("UPLOAD_WORKERS", "8"))
 MAX_USER_CONCURRENT_DOWNLOADS = int(os.getenv("MAX_USER_CONCURRENT_DOWNLOADS", "1"))
 COMMAND_COOLDOWN_SEC = float(os.getenv("COMMAND_COOLDOWN_SEC", "3"))
 DOWNLOAD_COOLDOWN_SEC = float(os.getenv("DOWNLOAD_COOLDOWN_SEC", "30"))
@@ -407,12 +413,85 @@ async def safe_edit(target: Any, text: str, **kwargs: Any) -> None:
         logger.debug("safe_edit skipped: %s", exc)
 
 
-async def send_file_compat(bot: TelegramClient, chat_id: int, file_path: str, **kwargs: Any) -> Any:
+async def send_file_compat(bot: TelegramClient, chat_id: int, file_path: Any, **kwargs: Any) -> Any:
     try:
         return await bot.send_file(chat_id, file_path, **kwargs)
     except TypeError:
         kwargs.pop("spoiler", None)
         return await bot.send_file(chat_id, file_path, **kwargs)
+
+
+async def fast_upload_file(
+    bot: TelegramClient,
+    file_path: Path,
+    progress_callback: Any = None,
+    workers: int = UPLOAD_WORKERS,
+) -> InputFile | InputFileBig:
+    """Upload a file to Telegram MTProto using parallel 512 KB chunks for maximum throughput."""
+    file_size = file_path.stat().st_size
+    part_size = 512 * 1024  # 512 KB max MTProto chunk size
+    part_count = max(1, math.ceil(file_size / part_size))
+    is_big = file_size > 10 * 1024 * 1024
+    file_id = generate_random_long()
+    md5_hash = None if is_big else hashlib.md5()
+
+    if not is_big:
+        with file_path.open("rb") as f:
+            while chunk := f.read(1024 * 1024):
+                md5_hash.update(chunk)
+
+    uploaded_bytes = 0
+    lock = asyncio.Lock()
+    sem = asyncio.Semaphore(max(1, workers))
+
+    async def upload_part(part_idx: int, chunk: bytes) -> None:
+        nonlocal uploaded_bytes
+        async with sem:
+            for attempt in range(3):
+                try:
+                    if is_big:
+                        await bot(SaveBigFilePartRequest(file_id, part_idx, part_count, chunk))
+                    else:
+                        await bot(SaveFilePartRequest(file_id, part_idx, chunk))
+                    break
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    if attempt == 2:
+                        raise
+                    logger.debug("Retrying part %d/%d after error: %s", part_idx, part_count, exc)
+                    await asyncio.sleep(1.0 * (attempt + 1))
+            async with lock:
+                uploaded_bytes += len(chunk)
+                if progress_callback:
+                    await progress_callback(uploaded_bytes, file_size)
+
+    pending: set[asyncio.Task[None]] = set()
+    with file_path.open("rb") as f:
+        for part_idx in range(part_count):
+            chunk = f.read(part_size)
+            if not chunk:
+                break
+            task = asyncio.create_task(upload_part(part_idx, chunk))
+            pending.add(task)
+            task.add_done_callback(pending.discard)
+            # Keep bounded number of in-flight tasks in memory
+            if len(pending) >= workers * 2:
+                done, _ = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                for d in done:
+                    d.result()
+
+    if pending:
+        await asyncio.gather(*pending)
+
+    if is_big:
+        return InputFileBig(id=file_id, parts=part_count, name=file_path.name)
+    return InputFile(
+        id=file_id,
+        parts=part_count,
+        name=file_path.name,
+        md5_checksum=md5_hash.hexdigest() if md5_hash else "",
+    )
 
 
 async def resolve_attr(obj: Any, *names: str, default: Any = None) -> Any:
@@ -501,14 +580,51 @@ def _extract_thumb_url(val: Any) -> str:
     return s if s.startswith(("http://", "https://")) else ""
 
 
+def _http_get_bytes(url: str, timeout: int = 12) -> bytes | None:
+    """Fetch URL bytes using curl_cffi (Chrome impersonation) -> httpx -> urllib."""
+    try:
+        from curl_cffi import requests as cffi_requests
+
+        resp = cffi_requests.get(
+            url,
+            headers=HTTP_HEADERS,
+            impersonate="chrome",
+            timeout=timeout,
+            allow_redirects=True,
+        )
+        if resp.status_code == 200 and resp.content:
+            return resp.content
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("curl_cffi fetch failed for %s: %s", url, exc)
+
+    try:
+        import httpx
+
+        with httpx.Client(headers=HTTP_HEADERS, follow_redirects=True, timeout=timeout) as client:
+            resp = client.get(url)
+            if resp.status_code == 200 and resp.content:
+                return resp.content
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("httpx fetch failed for %s: %s", url, exc)
+
+    try:
+        req = urllib.request.Request(url, headers=HTTP_HEADERS)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("urllib fetch failed for %s: %s", url, exc)
+    return None
+
+
 def _scrape_thumb_from_html(html_text: str) -> str:
     if not html_text:
         return ""
     patterns = (
-        r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
-        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']',
-        r'<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+property=["\']og:image(?::secure_url)?["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image(?::secure_url)?["\']',
+        r'<meta[^>]+name=["\']twitter:image(?::src)?["\'][^>]+content=["\']([^"\']+)["\']',
         r'poster=["\']([^"\']+\.(?:jpg|jpeg|png|webp)[^"\']*)["\']',
+        r'(?:data-src|data-lazy|src)=["\']((?:https?:)?//[^"\']+/(?:main|thumb|\d+)\.(?:jpg|jpeg|png|webp)[^"\']*)["\']',
         r'(?:https?:)?//[^"\'\s<>]+/(?:main|\d+)\.(?:jpg|jpeg|webp)',
     )
     for pat in patterns:
@@ -524,14 +640,10 @@ def _scrape_thumb_from_html(html_text: str) -> str:
 def fetch_page_thumb_sync(page_url: str) -> str:
     if not page_url:
         return ""
-    try:
-        req = urllib.request.Request(page_url, headers=HTTP_HEADERS)
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            html_text = resp.read().decode("utf-8", errors="ignore")
-        return _scrape_thumb_from_html(html_text)
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("Fallback HTML thumbnail scrape failed for %s: %s", page_url, exc)
+    raw = _http_get_bytes(page_url, timeout=12)
+    if not raw:
         return ""
+    return _scrape_thumb_from_html(raw.decode("utf-8", errors="ignore"))
 
 
 async def extract_meta(video: Any, hydrate: bool = True, need_thumb: bool = False) -> dict[str, Any]:
@@ -641,16 +753,19 @@ async def extract_meta(video: Any, hydrate: bool = True, need_thumb: bool = Fals
 def download_thumbnail_file(thumb_url: str, dest: Path) -> Path | None:
     if not thumb_url:
         return None
+    data = _http_get_bytes(thumb_url, timeout=12)
+    if not data or len(data) < 500:
+        logger.warning("Thumbnail download returned empty/small payload (%s)", thumb_url)
+        return None
     try:
-        req = urllib.request.Request(thumb_url, headers=HTTP_HEADERS)
-        with urllib.request.urlopen(req, timeout=12) as resp:
-            data = resp.read()
-        if data and len(data) > 500:
-            dest.write_bytes(data)
-            return dest
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Thumbnail download failed (%s): %s", thumb_url, exc)
-    return None
+        from PIL import Image
+
+        img = Image.open(io.BytesIO(data)).convert("RGB")
+        img.save(dest, format="JPEG", quality=90)
+        return dest
+    except Exception:
+        dest.write_bytes(data)
+        return dest
 
 
 def probe_video_info(file_path: Path, thumb_out: Path) -> tuple[int, int, int, Path | None]:
@@ -978,6 +1093,12 @@ async def render_page_payload(page_token: str, page_idx: int, user_id: int) -> t
     if page_idx < total_pages - 1:
         nav_row.append(Button.inline("Next ➡️", data=f"pg:{page_token}:{page_idx + 1}".encode()))
     buttons.append(nav_row)
+    if heading.startswith("🔥 Top"):
+        buttons.append([
+            Button.inline("🔥 Week", data=b"menu:top:week"),
+            Button.inline("🏆 Month", data=b"menu:top:month"),
+            Button.inline("👑 All Time", data=b"menu:top:all_time"),
+        ])
     buttons.append([Button.inline("🏠 Home", data=b"menu:home")])
 
     return text, buttons
@@ -1111,18 +1232,23 @@ def render_history_payload(user_id: int) -> tuple[str, list[list[Any]]]:
         )
 
     lines: list[str] = []
-    open_row: list[Any] = []
-    for idx, item in enumerate(hist[:5], start=1):
-        t = item["title"][:48] + ("…" if len(item["title"]) > 48 else "")
+    open_btns: list[Any] = []
+    for idx, item in enumerate(hist[:8], start=1):
+        t = item["title"][:46] + ("…" if len(item["title"]) > 46 else "")
         lines.append(
             f"<b>{idx:02d}.</b> {escape(t)}\n"
             f"      📦 <code>{escape(item['size'])}</code>  •  🎞 <code>{escape(item['quality'])}</code>  •  <i>{escape(item['at'])}</i>"
         )
         token = url_store.put({"title": item["title"], "url": item["url"]})
-        open_row.append(Button.inline(f"🔎 {idx}", data=f"info:{token}".encode()))
+        open_btns.append(Button.inline(f"🔎 {idx}", data=f"info:{token}".encode()))
 
+    buttons: list[list[Any]] = [open_btns[i : i + 4] for i in range(0, len(open_btns), 4)]
+    buttons.append([
+        Button.inline("🧹 Clear", data=b"set:clear:hist"),
+        Button.inline("⬅️ Back to Home", data=b"menu:home"),
+    ])
     text = "🕒 <b>Recent Downloads</b>\n\n<blockquote>" + "\n\n".join(lines) + "</blockquote>"
-    return text, [open_row, [Button.inline("⬅️ Back to Home", data=b"menu:home")]]
+    return text, buttons
 
 
 # ---------------------------------------------------------------------------
@@ -1130,12 +1256,18 @@ def render_history_payload(user_id: int) -> tuple[str, list[list[Any]]]:
 # ---------------------------------------------------------------------------
 
 
+def get_client_method(*names: str) -> Any:
+    for name in names:
+        fn = getattr(api_client, name, None)
+        if callable(fn):
+            return fn
+    raise RuntimeError(f"None of {names} is available on hqporner_api.Client.")
+
+
 async def fetch_category(bot: TelegramClient, chat_id: int, user_id: int, category: str) -> None:
     msg = await bot.send_message(chat_id, f"⏳ Loading category <code>{escape(category)}</code>…", parse_mode="html")
     try:
-        fn = getattr(api_client, "get_videos_by_category", None)
-        if fn is None:
-            raise RuntimeError("Client.get_videos_by_category is not available.")
+        fn = get_client_method("get_videos_by_category", "get_category")
         videos = await collect_videos(fn(category), MAX_FETCH_RESULTS)
         await send_paginated_list(bot, chat_id, user_id, f"📂 Category • {category}", videos, edit_msg=msg)
     except Exception as exc:  # noqa: BLE001
@@ -1145,9 +1277,7 @@ async def fetch_category(bot: TelegramClient, chat_id: int, user_id: int, catego
 async def fetch_actress(bot: TelegramClient, chat_id: int, user_id: int, actress: str) -> None:
     msg = await bot.send_message(chat_id, f"⏳ Loading <code>{escape(actress)}</code>…", parse_mode="html")
     try:
-        fn = getattr(api_client, "get_videos_by_actress", None)
-        if fn is None:
-            raise RuntimeError("Client.get_videos_by_actress is not available.")
+        fn = get_client_method("get_videos_by_actress", "get_actress")
         videos = await collect_videos(fn(actress), MAX_FETCH_RESULTS)
         await send_paginated_list(bot, chat_id, user_id, f"👤 Cast • {actress}", videos, edit_msg=msg)
     except Exception as exc:  # noqa: BLE001
@@ -1159,9 +1289,7 @@ async def fetch_brazzers(bot: TelegramClient, chat_id: int, user_id: int, edit_m
     if edit_msg:
         await safe_edit(msg, "⏳ Loading Brazzers videos…")
     try:
-        fn = getattr(api_client, "get_brazzers_videos", None)
-        if fn is None:
-            raise RuntimeError("Client.get_brazzers_videos is not available.")
+        fn = get_client_method("get_brazzers_videos", "get_brazzers")
         videos = await collect_videos(fn(), MAX_FETCH_RESULTS)
         await send_paginated_list(bot, chat_id, user_id, "💎 Brazzers", videos, edit_msg=msg)
     except Exception as exc:  # noqa: BLE001
@@ -1408,19 +1536,44 @@ async def run_download_job(
                     f"<blockquote>{'  •  '.join(meta_parts)}</blockquote>"
                 )
 
-                await send_file_compat(
-                    bot,
-                    chat_id,
-                    str(file_path),
-                    caption=final_caption[:1024],
-                    parse_mode="html",
-                    thumb=str(final_thumb) if final_thumb else None,
-                    attributes=attrs or None,
-                    force_document=as_doc,
-                    supports_streaming=not as_doc,
-                    spoiler=bool(u["spoiler_blur"]) and not as_doc,
-                    progress_callback=upload_progress,
-                )
+                try:
+                    uploaded_handle = await fast_upload_file(
+                        bot, file_path, progress_callback=upload_progress
+                    )
+                    await safe_edit(
+                        status,
+                        f"✨ <b>Finalizing &amp; Sending Video…</b>\n\n"
+                        f"<blockquote>🎬 <b>{escape(short_title)}</b>\n"
+                        f"📦 <code>{format_bytes(file_bytes)}</code>  •  🎞 <code>{escape(quality.upper())}</code></blockquote>",
+                        parse_mode="html",
+                    )
+                    await send_file_compat(
+                        bot,
+                        chat_id,
+                        uploaded_handle,
+                        caption=final_caption[:1024],
+                        parse_mode="html",
+                        thumb=str(final_thumb) if final_thumb else None,
+                        attributes=attrs or None,
+                        force_document=as_doc,
+                        supports_streaming=not as_doc,
+                        spoiler=bool(u["spoiler_blur"]) and not as_doc,
+                    )
+                except Exception as fast_exc:  # noqa: BLE001
+                    logger.warning("Parallel upload fallback (%s), using standard send_file", fast_exc)
+                    await send_file_compat(
+                        bot,
+                        chat_id,
+                        str(file_path),
+                        caption=final_caption[:1024],
+                        parse_mode="html",
+                        thumb=str(final_thumb) if final_thumb else None,
+                        attributes=attrs or None,
+                        force_document=as_doc,
+                        supports_streaming=not as_doc,
+                        spoiler=bool(u["spoiler_blur"]) and not as_doc,
+                        progress_callback=upload_progress,
+                    )
                 store.record_download(user_id, title, url, quality, file_bytes)
                 await status.delete()
 
@@ -1439,7 +1592,19 @@ async def run_download_job(
 
 
 async def main() -> None:
-    bot = TelegramClient("hqporner_bot_session", API_ID, API_HASH)
+    try:
+        import cryptg  # noqa: F401
+        logger.info("cryptg C-extension active (fast AES encryption enabled)")
+    except ImportError:
+        logger.warning("cryptg not installed — MTProto uploads will be slower!")
+    bot = TelegramClient(
+        "hqporner_bot_session",
+        API_ID,
+        API_HASH,
+        connection_retries=10,
+        request_retries=10,
+        flood_sleep_threshold=60,
+    )
     await bot.start(bot_token=BOT_TOKEN)
     me = await bot.get_me()
     logger.info(
